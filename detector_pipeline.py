@@ -201,7 +201,7 @@ class DetectorPipeline:
         try:
             from sentence_transformers import SentenceTransformer
             self.embedding_model = SentenceTransformer(
-                'paraphrase-multilingual-MiniLM-L12-v2',
+                'paraphrase-multilingual-MiniLM-L6-v2',
                 device=self.device
             )
             # Verifikasi: encode satu teks dummy dan cek normanya
