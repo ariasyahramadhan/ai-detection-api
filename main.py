@@ -27,11 +27,11 @@ _loading = False
 _load_lock = threading.Lock()
 
 
-def _load_models():
+def _load_models_background():
     global _pipeline, _keras_model, _load_error, _loading
     with _load_lock:
         if _pipeline is not None and _keras_model is not None:
-            return  # sudah loaded
+            return
         if _loading:
             return
         _loading = True
@@ -53,6 +53,14 @@ def _load_models():
         logger.error(f"❌ Gagal load model: {e}")
     finally:
         _loading = False
+
+
+# ── Load model di background saat startup (non-blocking) ────────
+@app.on_event("startup")
+async def startup_event():
+    t = threading.Thread(target=_load_models_background, daemon=True)
+    t.start()
+    logger.info("Model loading started in background thread.")
 
 
 # ── Helper: ekstrak teks dari file ──────────────────────────────
@@ -83,6 +91,8 @@ def root():
         "message": "AI Detection API v2 is running",
         "pipeline_ready": _pipeline is not None,
         "model_ready": _keras_model is not None,
+        "loading": _loading,
+        "load_error": _load_error,
     }
 
 
@@ -92,6 +102,7 @@ def health():
         "status": "ok",
         "pipeline_ready": _pipeline is not None,
         "model_ready": _keras_model is not None,
+        "loading": _loading,
         "load_error": _load_error,
     }
 
@@ -101,13 +112,22 @@ async def detect_ai(
     text: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
 ):
-    # Lazy load model saat pertama kali dipanggil
+    # Cek apakah model sudah siap (jangan block — loading di background)
     if _pipeline is None or _keras_model is None:
-        _load_models()
-
-    if _pipeline is None or _keras_model is None:
-        detail = f"Model gagal dimuat: {_load_error}" if _load_error else "Model sedang dimuat, coba lagi dalam beberapa detik."
-        raise HTTPException(status_code=503, detail=detail)
+        if _loading:
+            raise HTTPException(
+                status_code=503,
+                detail="Model sedang dimuat, tunggu beberapa saat lalu coba lagi."
+            )
+        if _load_error:
+            raise HTTPException(status_code=503, detail=f"Model gagal dimuat: {_load_error}")
+        # Belum ada trigger loading sama sekali, jalankan background
+        t = threading.Thread(target=_load_models_background, daemon=True)
+        t.start()
+        raise HTTPException(
+            status_code=503,
+            detail="Model sedang dimuat, tunggu beberapa saat lalu coba lagi."
+        )
 
     # 1. Ambil teks input
     input_text = ""
@@ -144,8 +164,8 @@ async def detect_ai(
         import numpy as np
 
         processed = _pipeline.process_text(input_text)
-        x_struct = processed["x_struct"]  # (1, n_features)
-        x_embed = processed["x_embed"]   # (1, 384)
+        x_struct = processed["x_struct"]
+        x_embed = processed["x_embed"]
 
         if _pipeline.scaler is not None:
             x_struct = _pipeline.scaler.transform(x_struct)
