@@ -5,9 +5,6 @@ import pickle
 import numpy as np
 from pathlib import Path
 
-# Jangan mengimport sentence_transformers di top level
-# untuk menghindari load lambat atau GPU issue saat di-import oleh skrip lain.
-
 # ==========================================
 # CONSTANTS & CONFIGURATION
 # ==========================================
@@ -26,7 +23,7 @@ SUBSTITUTIONS = {
 EN_STOPWORDS = {'and', 'the', 'is', 'in', 'of', 'to', 'this', 'that', 'it', 'for'}
 ID_STOPWORDS = {'dan', 'yang', 'di', 'dari', 'ke', 'ini', 'itu', 'pada', 'dengan', 'untuk'}
 
-# Default kanonik
+# Default kanonik (29 fitur)
 ALL_FEATURES = [
     "sentence_count", "avg_sentence_length", "sentence_length_std",
     "paragraph_count", "paragraph_length_std", "unique_word_ratio",
@@ -40,6 +37,18 @@ ALL_FEATURES = [
     "not_only_but_also", "formal_tone_score", "copypaste_artifact_count"
 ]
 
+# 23 fitur aktif — sesuai model best_model.keras (expected shape=(None, 23))
+ACTIVE_FEATURES_23 = [
+    "sentence_count", "avg_sentence_length", "sentence_length_std",
+    "paragraph_count", "paragraph_length_std", "unique_word_ratio",
+    "em_dash_density", "colon_density", "semicolon_density",
+    "exclamation_density", "question_density", "bullet_list_count",
+    "bold_pattern_count", "header_pattern_count", "avg_word_length",
+    "comma_density", "parenthesis_density", "contraction_count",
+    "number_density", "capital_ratio",
+    "ai_vocab_density", "hedging_density", "transition_density"
+]
+
 # Regex patterns (compiled)
 _RE_SENTENCES   = re.compile(r"[.!?]+")
 _RE_WORDS       = re.compile(r"\b\w+\b")
@@ -51,24 +60,12 @@ _EM_DASH        = "\u2014"
 
 
 class DetectorPipeline:
-    """
-    Pipeline lengkap untuk inference deteksi tulisan AI.
-
-    Alur:
-        raw_text
-            → clean_text()
-            → detect_language()
-            → extract_features()           → raw 29-dim float array
-            → scaler.transform()           → scaled 29-dim float array  (WAJIB!)
-            → SentenceTransformer.encode() → 384-dim L2-normalized vector (WAJIB!)
-            → (scaled_struct, embed)       → siap untuk model.predict()
-    """
 
     def __init__(self, use_gpu=True):
         self.wordlists       = {}
-        self.active_features = ALL_FEATURES.copy()
+        self.active_features = ACTIVE_FEATURES_23.copy()  # default 23 fitur
         self.embedding_model = None
-        self.scaler          = None          # StandardScaler — dimuat dari SCALER_FILE
+        self.scaler          = None
         self.device          = "cuda" if use_gpu else "cpu"
 
         self._load_config()
@@ -85,16 +82,11 @@ class DetectorPipeline:
             try:
                 with open(FEATURE_CONFIG_FILE, encoding="utf-8") as f:
                     cfg = json.load(f)
-                self.active_features = cfg.get("active_features", ALL_FEATURES)
+                self.active_features = cfg.get("active_features", ACTIVE_FEATURES_23)
             except Exception as e:
-                print(f"Warning: Gagal membaca {FEATURE_CONFIG_FILE}. Menggunakan ALL_FEATURES. Error: {e}")
+                print(f"Warning: Gagal membaca {FEATURE_CONFIG_FILE}. Menggunakan ACTIVE_FEATURES_23. Error: {e}")
 
     def _load_scaler(self):
-        """
-        Muat StandardScaler yang di-fit saat training (Notebook 4).
-        Scaler WAJIB ada agar fitur struktural memiliki distribusi yang sama
-        seperti saat training. Tanpa scaler, prediksi akan selalu ekstrem (0 atau 1).
-        """
         if os.path.exists(SCALER_FILE):
             try:
                 with open(SCALER_FILE, "rb") as f:
@@ -106,7 +98,6 @@ class DetectorPipeline:
                       f"Prediksi akan tidak akurat! Error: {e}")
         else:
             print(f"[Pipeline] Warning: {SCALER_FILE} tidak ditemukan. "
-                  f"Jalankan Notebook 4 (training) terlebih dahulu. "
                   f"Prediksi TIDAK akan akurat tanpa scaler!")
 
     def _flat_set(self, data, key):
@@ -193,23 +184,18 @@ class DetectorPipeline:
             print(f"Warning: Gagal memuat sebagian wordlists. Error: {e}")
 
     def _load_embedding_model(self):
-        """
-        Load SentenceTransformer MiniLM.
-        PENTING: normalize_embeddings=True wajib digunakan saat encode()
-        agar konsisten dengan training di Notebook 3.
-        """
         try:
             from sentence_transformers import SentenceTransformer
+            # Ganti L12 → L6 untuk hemat RAM (~120MB vs ~500MB)
             self.embedding_model = SentenceTransformer(
                 'paraphrase-multilingual-MiniLM-L6-v2',
                 device=self.device
             )
-            # Verifikasi: encode satu teks dummy dan cek normanya
             test_vec  = self.embedding_model.encode(
                 ["test"], convert_to_numpy=True, normalize_embeddings=True
             )
             test_norm = float(np.linalg.norm(test_vec[0]))
-            print(f"[Pipeline] MiniLM dimuat. L2 norm test: {test_norm:.4f} (harus ≈ 1.0)")
+            print(f"[Pipeline] MiniLM-L6 dimuat. L2 norm test: {test_norm:.4f} (harus ≈ 1.0)")
         except Exception as e:
             print(f"[Pipeline] Warning: Gagal memuat SentenceTransformer. Error: {e}")
 
@@ -265,14 +251,6 @@ class DetectorPipeline:
     # ----------------------------------------------------------
 
     def extract_features(self, text, lang="en"):
-        """
-        Ekstrak 29 fitur raw dari teks (BELUM di-scale).
-        Scaler akan diterapkan terpisah di process_text().
-
-        Returns:
-            features_dict   : dict {feature_name: raw_float_value}
-            struct_array_raw: np.ndarray shape (1, n_active_features), dtype float32, BELUM di-scale
-        """
         if not isinstance(text, str) or not text.strip():
             features = {feat: 0.0 for feat in ALL_FEATURES}
             return features, np.zeros((1, len(self.active_features)), dtype=np.float32)
@@ -350,11 +328,11 @@ class DetectorPipeline:
             for feat in ALL_FEATURES[20:]:
                 features[feat] = 0.0
 
-        # Susun array sesuai urutan active_features
+        # Susun array sesuai urutan active_features (23 fitur)
         struct_array_raw = np.array(
             [features.get(f, 0.0) for f in self.active_features],
             dtype=np.float32
-        ).reshape(1, -1)  # shape (1, n_features)
+        ).reshape(1, -1)
 
         return features, struct_array_raw
 
@@ -363,29 +341,16 @@ class DetectorPipeline:
     # ----------------------------------------------------------
 
     def process_text(self, raw_text, force_lang=None):
-        """
-        Proses satu teks raw menjadi input siap untuk model.
-
-        Returns dict:
-            language      : 'en' atau 'id'
-            text_clean    : teks setelah pembersihan
-            features_dict : nilai raw setiap fitur (untuk display)
-            x_struct      : np.ndarray (1, n_features), float32, RAW (belum di-scale)
-                            → subprocess akan menyimpan ini, dan Notebook 5 yang akan apply scaler
-            x_embed       : np.ndarray (1, 384), float32, L2-normalized
-        """
         text_clean  = self.clean_text(raw_text)
         lang        = force_lang if force_lang in ('en', 'id') else self.detect_language(text_clean)
 
-        # Ekstrak fitur struktural (raw, belum di-scale)
         features_dict, struct_array_raw = self.extract_features(text_clean, lang=lang)
 
-        # Encode embedding (L2-normalized — HARUS konsisten dengan Notebook 3)
         if self.embedding_model:
             embed_array = self.embedding_model.encode(
                 [text_clean],
                 convert_to_numpy=True,
-                normalize_embeddings=True  # WAJIB: konsisten dengan training
+                normalize_embeddings=True
             )
         else:
             embed_array = np.zeros((1, 384), dtype=np.float32)
@@ -394,6 +359,6 @@ class DetectorPipeline:
             "language"     : lang,
             "text_clean"   : text_clean,
             "features_dict": features_dict,
-            "x_struct"     : struct_array_raw,   # (1, n_features) — RAW, scaler applied di NB5
-            "x_embed"      : embed_array          # (1, 384) — L2-normalized
+            "x_struct"     : struct_array_raw,
+            "x_embed"      : embed_array
         }
