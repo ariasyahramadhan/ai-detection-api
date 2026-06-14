@@ -4,6 +4,7 @@ from typing import Optional
 import uvicorn
 import logging
 import io
+import threading
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -12,33 +13,46 @@ app = FastAPI(title="AI Detection API v2", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Ganti dengan URL frontend kamu setelah deploy
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ── Global model state ───────────────────────────────────────────
-pipeline = None
-keras_model = None
+_pipeline = None
+_keras_model = None
+_load_error = None
+_loading = False
+_load_lock = threading.Lock()
 
 
-@app.on_event("startup")
-async def load_model():
-    global pipeline, keras_model
+def _load_models():
+    global _pipeline, _keras_model, _load_error, _loading
+    with _load_lock:
+        if _pipeline is not None and _keras_model is not None:
+            return  # sudah loaded
+        if _loading:
+            return
+        _loading = True
+
     try:
-        import tensorflow as tf
-        from detector_pipeline import DetectorPipeline
-
         logger.info("Loading DetectorPipeline...")
-        pipeline = DetectorPipeline(use_gpu=False)
+        from detector_pipeline import DetectorPipeline
+        _pipeline = DetectorPipeline(use_gpu=False)
+        logger.info("DetectorPipeline loaded.")
 
         logger.info("Loading Keras model...")
-        keras_model = tf.keras.models.load_model("best_model.keras")
-
+        import tensorflow as tf
+        _keras_model = tf.keras.models.load_model("best_model.keras")
         logger.info("✅ Semua model berhasil dimuat!")
+        _load_error = None
+
     except Exception as e:
+        _load_error = str(e)
         logger.error(f"❌ Gagal load model: {e}")
+    finally:
+        _loading = False
 
 
 # ── Helper: ekstrak teks dari file ──────────────────────────────
@@ -67,8 +81,8 @@ def extract_text_from_file(content: bytes, content_type: str) -> str:
 def root():
     return {
         "message": "AI Detection API v2 is running",
-        "pipeline_ready": pipeline is not None,
-        "model_ready": keras_model is not None,
+        "pipeline_ready": _pipeline is not None,
+        "model_ready": _keras_model is not None,
     }
 
 
@@ -76,8 +90,9 @@ def root():
 def health():
     return {
         "status": "ok",
-        "pipeline_ready": pipeline is not None,
-        "model_ready": keras_model is not None,
+        "pipeline_ready": _pipeline is not None,
+        "model_ready": _keras_model is not None,
+        "load_error": _load_error,
     }
 
 
@@ -86,11 +101,13 @@ async def detect_ai(
     text: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
 ):
-    if pipeline is None or keras_model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model belum siap, coba beberapa saat lagi.",
-        )
+    # Lazy load model saat pertama kali dipanggil
+    if _pipeline is None or _keras_model is None:
+        _load_models()
+
+    if _pipeline is None or _keras_model is None:
+        detail = f"Model gagal dimuat: {_load_error}" if _load_error else "Model sedang dimuat, coba lagi dalam beberapa detik."
+        raise HTTPException(status_code=503, detail=detail)
 
     # 1. Ambil teks input
     input_text = ""
@@ -126,17 +143,14 @@ async def detect_ai(
     try:
         import numpy as np
 
-        processed = pipeline.process_text(input_text)
-
+        processed = _pipeline.process_text(input_text)
         x_struct = processed["x_struct"]  # (1, n_features)
         x_embed = processed["x_embed"]   # (1, 384)
 
-        # Apply scaler jika tersedia
-        if pipeline.scaler is not None:
-            x_struct = pipeline.scaler.transform(x_struct)
+        if _pipeline.scaler is not None:
+            x_struct = _pipeline.scaler.transform(x_struct)
 
-        # Prediksi dengan Keras model
-        prob = float(keras_model.predict([x_struct, x_embed], verbose=0)[0][0])
+        prob = float(_keras_model.predict([x_struct, x_embed], verbose=0)[0][0])
 
         features = processed["features_dict"]
         word_count = len(input_text.split())
